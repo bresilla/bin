@@ -5,6 +5,10 @@ on:
     tags:
       - '**'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release'
+        required: true
 
 permissions:
   contents: write
@@ -17,6 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
