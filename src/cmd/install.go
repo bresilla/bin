@@ -75,10 +75,17 @@ func newInstallCmd() *installCmd {
 				return fmt.Errorf("error installing binary: %w", err)
 			}
 
-			// Convert to absolute path before storing in config
-			absPath, err := filepath.Abs(resolvedPath)
-			if err != nil {
-				return fmt.Errorf("error converting to absolute path: %w", err)
+			// Store an absolute path. If the path is already absolute once
+			// environment variables are expanded (e.g. "$HOME/.local/bin/foo"),
+			// keep that portable form as-is — running filepath.Abs on it would
+			// treat the unexpanded "$HOME/…" as relative and wrongly prepend the
+			// current directory.
+			absPath := resolvedPath
+			if !filepath.IsAbs(os.ExpandEnv(resolvedPath)) {
+				absPath, err = filepath.Abs(resolvedPath)
+				if err != nil {
+					return fmt.Errorf("error converting to absolute path: %w", err)
+				}
 			}
 
 			err = config.UpsertBinary(&config.Binary{
