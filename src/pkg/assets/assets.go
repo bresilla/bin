@@ -114,10 +114,6 @@ type FilterOpts struct {
 	// NonInteractive makes asset selection fail instead of prompting when it
 	// can't decide on its own. Used by the TUI, which owns the terminal.
 	NonInteractive bool
-
-	// Auto makes selection pick the best candidate automatically (preferring
-	// musl over glibc/gnu) instead of prompting. Used by `bin ensure`.
-	Auto bool
 }
 
 type runtimeResolver struct{}
@@ -190,71 +186,98 @@ var installableSuffixes = []string{
 	".tar", ".zip", ".gz", ".xz", ".bz2",
 }
 
-// isUsableAsset reports whether an asset is something bin can actually install:
-// a supported archive, an OS-specific single file (AppImage/exe), or a raw
-// extensionless binary. Signatures, checksums, SBOMs, wheels, distro packages
-// and similar metadata files are rejected.
+// ignoredExts are file extensions that are never installable binaries:
+// signatures, checksums, SBOMs, packages, docs, etc.
+var ignoredExts = map[string]bool{
+	"sha256": true, "sha512": true, "sha1": true, "md5": true, "sum": true,
+	"checksum": true, "sig": true, "sigstore": true, "asc": true, "gpg": true,
+	"pem": true, "pub": true, "crt": true, "cert": true, "minisig": true,
+	"sbom": true, "spdx": true, "cdx": true, "intoto": true, "jsonl": true,
+	"json": true, "txt": true, "md": true, "yaml": true, "yml": true,
+	"deb": true, "rpm": true, "msi": true, "pkg": true, "dmg": true,
+	"apk": true, "snap": true, "flatpak": true, "whl": true,
+	// zstd isn't supported by the extractor, so don't offer it (this also
+	// covers .tar.zst, whose filepath.Ext is ".zst").
+	"zst": true,
+	// libraries / object files are never the CLI binary we want.
+	"a": true, "o": true, "so": true, "dll": true, "dylib": true, "lib": true,
+}
+
+// isUsableAsset reports whether an asset could be something bin can install.
+// It keeps supported archives, OS-appropriate single files, and raw binaries
+// (which are often extensionless and contain dots from a version, e.g.
+// "tool-7.1.0-linux-amd64"), and rejects only known non-binary file types.
 func isUsableAsset(name string) bool {
 	n := strings.ToLower(name)
+
+	// Supported archives are always fine.
 	for _, s := range installableSuffixes {
 		if strings.HasSuffix(n, s) {
 			return true
 		}
 	}
+	// OS-specific single files for the current platform (AppImage / exe).
 	for _, ext := range resolver.GetOSSpecificExtensions() {
 		if strings.HasSuffix(n, "."+strings.ToLower(ext)) {
 			return true
 		}
 	}
-	// No extension, or a trailing ".<digits>" that's really a version number
-	// (e.g. "tool-v0.140.0") => treat as a raw binary.
-	ext := strings.TrimPrefix(filepath.Ext(n), ".")
-	if ext == "" || isAllDigits(ext) {
-		return true
-	}
-	return false
-}
 
-// isAllDigits reports whether s is non-empty and composed solely of digits.
-func isAllDigits(s string) bool {
-	if s == "" {
+	ext := strings.TrimPrefix(filepath.Ext(n), ".")
+	switch {
+	case ignoredExts[ext]:
+		return false
+	case ext == "exe", ext == "appimage", ext == "dmg":
+		// Executables for another OS (the current-OS ones were kept above).
 		return false
 	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
+	// Everything else — raw binaries (extensionless or with a dotted version)
+	// and unknown formats — is kept; scoring decides the best match.
 	return true
 }
 
-// rankAsset scores a candidate for automatic selection: musl is preferred over
-// a static/neutral build, which is preferred over glibc/gnu.
-func rankAsset(name string) int {
-	n := strings.ToLower(name)
-	switch {
-	case strings.Contains(n, "musl"):
-		return 2
-	case strings.Contains(n, "gnu"), strings.Contains(n, "glibc"):
-		return 0
-	default:
-		return 1
+// preferMusl collapses assets that are identical except for their libc flavor
+// (musl vs glibc/gnu): when a group contains a musl build, the glibc/gnu twins
+// are dropped so only musl is offered. Assets without a musl twin are kept as
+// is — this only hides redundant duplicates, it never hides real choices.
+func preferMusl(as []*Asset) []*Asset {
+	stem := func(name string) string {
+		n := strings.ToLower(name)
+		for _, t := range []string{"musl", "glibc", "gnu"} {
+			n = strings.ReplaceAll(n, t, "")
+		}
+		return n
 	}
-}
 
-// autoPick chooses the best match without prompting: highest rank, ties broken
-// by name for determinism.
-func autoPick(matches []*FilteredAsset) *FilteredAsset {
-	best := matches[0]
-	for _, m := range matches[1:] {
-		switch r, br := rankAsset(m.Name), rankAsset(best.Name); {
-		case r > br:
-			best = m
-		case r == br && m.Name < best.Name:
-			best = m
+	groups := map[string][]*Asset{}
+	order := []string{}
+	for _, a := range as {
+		s := stem(a.Name)
+		if _, ok := groups[s]; !ok {
+			order = append(order, s)
+		}
+		groups[s] = append(groups[s], a)
+	}
+
+	out := make([]*Asset, 0, len(as))
+	for _, s := range order {
+		g := groups[s]
+		hasMusl := false
+		for _, a := range g {
+			if strings.Contains(strings.ToLower(a.Name), "musl") {
+				hasMusl = true
+				break
+			}
+		}
+		for _, a := range g {
+			n := strings.ToLower(a.Name)
+			if hasMusl && (strings.Contains(n, "gnu") || strings.Contains(n, "glibc")) {
+				continue // drop the glibc/gnu twin in favor of musl
+			}
+			out = append(out, a)
 		}
 	}
-	return best
+	return out
 }
 
 var tarSuffixes = []string{".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".tar"}
@@ -325,6 +348,33 @@ func preferArchiveType(as []*Asset) []*Asset {
 	return out
 }
 
+// Preview runs the release-asset selection pipeline over the given asset names
+// without downloading anything. It returns the auto-selected asset (chosen) or,
+// when the choice is ambiguous, the candidates the user would be prompted with.
+// Intended for diagnostics/testing.
+func Preview(repoName string, names []string) (chosen string, options []string) {
+	as := make([]*Asset, 0, len(names))
+	for _, n := range names {
+		as = append(as, &Asset{Name: n})
+	}
+	usable := filterUsableAssets(as)
+	if len(usable) == 0 {
+		usable = as
+	}
+	usable = preferArchiveType(usable)
+	usable = preferMusl(usable)
+
+	f := &Filter{opts: &FilterOpts{}}
+	matches := f.scoredMatches(repoName, usable)
+	if len(matches) == 1 {
+		return matches[0].Name, nil
+	}
+	for _, m := range matches {
+		options = append(options, m.Name)
+	}
+	return "", options
+}
+
 func filterUsableAssets(as []*Asset) []*Asset {
 	out := make([]*Asset, 0, len(as))
 	for _, a := range as {
@@ -351,6 +401,7 @@ func (f *Filter) SelectReleaseAsset(repoName string, as []*Asset) (*FilteredAsse
 		usable = as
 	}
 	usable = preferArchiveType(usable)
+	usable = preferMusl(usable)
 
 	fp := Fingerprint(usable)
 
@@ -382,79 +433,75 @@ func (f *Filter) SelectReleaseAsset(repoName string, as []*Asset) (*FilteredAsse
 	return gf, nil
 }
 
-// FilterAssets receives a slice of GL assets and tries to
-// select the proper one and ask the user to manually select one
-// in case it can't determine it
-func (f *Filter) FilterAssets(repoName string, as []*Asset) (*FilteredAsset, error) {
+// scoredMatches scores the candidates by OS/arch/repo and returns the
+// highest-scoring subset (the set a user would be prompted with). With a single
+// candidate or SkipScoring it returns everything unscored.
+func (f *Filter) scoredMatches(repoName string, as []*Asset) []*FilteredAsset {
 	matches := []*FilteredAsset{}
 	if len(as) == 1 {
 		a := as[0]
-		matches = append(matches, &FilteredAsset{RepoName: repoName, Name: a.Name, URL: a.URL, score: 0})
-	} else {
-		if !f.opts.SkipScoring {
-			scores := map[string]int{}
-			scoreKeys := []string{}
-			scores[repoName] = 1
-			for _, os := range resolver.GetOS() {
-				scores[os] = 10
-			}
-			for _, arch := range resolver.GetArch() {
-				scores[arch] = 5
-			}
-			for _, osSpecificExtension := range resolver.GetOSSpecificExtensions() {
-				scores[osSpecificExtension] = 15
-			}
+		return []*FilteredAsset{{RepoName: repoName, Name: a.Name, DisplayName: a.DisplayName, URL: a.URL, score: 0}}
+	}
+	if f.opts.SkipScoring {
+		log.Debugf("--all flag was supplied, skipping scoring")
+		for _, a := range as {
+			matches = append(matches, &FilteredAsset{RepoName: repoName, Name: a.Name, DisplayName: a.DisplayName, URL: a.URL, score: 0})
+		}
+		return matches
+	}
 
-			for key := range scores {
-				scoreKeys = append(scoreKeys, strings.ToLower(key))
-			}
+	scores := map[string]int{}
+	scoreKeys := []string{}
+	scores[repoName] = 1
+	for _, os := range resolver.GetOS() {
+		scores[os] = 10
+	}
+	for _, arch := range resolver.GetArch() {
+		scores[arch] = 5
+	}
+	for _, osSpecificExtension := range resolver.GetOSSpecificExtensions() {
+		scores[osSpecificExtension] = 15
+	}
+	for key := range scores {
+		scoreKeys = append(scoreKeys, strings.ToLower(key))
+	}
 
-			for _, a := range as {
-				highestScoreForAsset := 0
-				gf := &FilteredAsset{RepoName: repoName, Name: a.Name, DisplayName: a.DisplayName, URL: a.URL, score: 0}
-				candidate := a.Name
-				candidateScore := 0
-				if bstrings.ContainsAny(strings.ToLower(candidate), scoreKeys) &&
-					isSupportedExt(candidate) {
-					for toMatch, score := range scores {
-						if strings.Contains(strings.ToLower(candidate), strings.ToLower(toMatch)) {
-							log.Debugf("Candidate %s contains %s. Adding score %d", candidate, toMatch, score)
-							candidateScore += score
-						}
-					}
-					if candidateScore > highestScoreForAsset {
-						highestScoreForAsset = candidateScore
-						gf.Name = candidate
-						gf.score = candidateScore
-					}
-				}
-
-				if highestScoreForAsset > 0 {
-					matches = append(matches, gf)
+	for _, a := range as {
+		gf := &FilteredAsset{RepoName: repoName, Name: a.Name, DisplayName: a.DisplayName, URL: a.URL, score: 0}
+		candidate := a.Name
+		candidateScore := 0
+		if bstrings.ContainsAny(strings.ToLower(candidate), scoreKeys) && isSupportedExt(candidate) {
+			for toMatch, score := range scores {
+				if strings.Contains(strings.ToLower(candidate), strings.ToLower(toMatch)) {
+					log.Debugf("Candidate %s contains %s. Adding score %d", candidate, toMatch, score)
+					candidateScore += score
 				}
 			}
-			highestAssetScore := 0
-			for i := range matches {
-				if matches[i].score > highestAssetScore {
-					highestAssetScore = matches[i].score
-				}
-			}
-			for i := len(matches) - 1; i >= 0; i-- {
-				if matches[i].score < highestAssetScore {
-					log.Debugf("Removing %v (URL %v) with score %v lower than %v", matches[i].Name, matches[i].URL, matches[i].score, highestAssetScore)
-					matches = append(matches[:i], matches[i+1:]...)
-				} else {
-					log.Debugf("Keeping %v (URL %v) with highest score %v", matches[i].Name, matches[i].URL, matches[i].score)
-				}
-			}
-
-		} else {
-			log.Debugf("--all flag was supplied, skipping scoring")
-			for _, a := range as {
-				matches = append(matches, &FilteredAsset{RepoName: repoName, Name: a.Name, DisplayName: a.DisplayName, URL: a.URL, score: 0})
-			}
+			gf.score = candidateScore
+		}
+		if gf.score > 0 {
+			matches = append(matches, gf)
 		}
 	}
+
+	highest := 0
+	for _, m := range matches {
+		if m.score > highest {
+			highest = m.score
+		}
+	}
+	for i := len(matches) - 1; i >= 0; i-- {
+		if matches[i].score < highest {
+			matches = append(matches[:i], matches[i+1:]...)
+		}
+	}
+	return matches
+}
+
+// FilterAssets selects the proper asset, prompting the user when it can't
+// determine a single best match.
+func (f *Filter) FilterAssets(repoName string, as []*Asset) (*FilteredAsset, error) {
+	matches := f.scoredMatches(repoName, as)
 
 	var gf *FilteredAsset
 	if len(matches) == 0 {
@@ -468,12 +515,6 @@ func (f *Filter) FilterAssets(repoName string, as []*Asset) (*FilteredAsset, err
 		sort.SliceStable(generic, func(i, j int) bool {
 			return generic[i].String() < generic[j].String()
 		})
-
-		// Auto mode (e.g. `bin ensure` without --choose): pick the best match
-		// without prompting, preferring musl over glibc/gnu.
-		if f.opts.Auto {
-			return autoPick(matches), nil
-		}
 
 		if f.opts.NonInteractive {
 			return nil, fmt.Errorf("multiple matching assets and running non-interactively; run `bin update -r %s` to choose", repoName)

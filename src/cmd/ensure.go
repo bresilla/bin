@@ -15,12 +15,7 @@ import (
 )
 
 type ensureCmd struct {
-	cmd  *cobra.Command
-	opts ensureOpts
-}
-
-type ensureOpts struct {
-	choose bool
+	cmd *cobra.Command
 }
 
 func newEnsureCmd() *ensureCmd {
@@ -87,7 +82,7 @@ func newEnsureCmd() *ensureCmd {
 				}
 				log.Debugf("Using provider '%s' for '%s'", p.GetID(), binCfg.URL)
 
-				pResult, err := p.Fetch(&providers.FetchOpts{Version: binCfg.Version, PackagePath: binCfg.PackagePath, PackageName: binCfg.RemoteName, SelectedAsset: binCfg.SelectedAsset, AssetFingerprint: binCfg.AssetFingerprint, PackageFingerprint: binCfg.PackageFingerprint, Auto: !root.opts.choose})
+				pResult, err := p.Fetch(&providers.FetchOpts{Version: binCfg.Version, PackagePath: binCfg.PackagePath, PackageName: binCfg.RemoteName, SelectedAsset: binCfg.SelectedAsset, AssetFingerprint: binCfg.AssetFingerprint, PackageFingerprint: binCfg.PackageFingerprint})
 				if err != nil {
 					return err
 				}
@@ -126,6 +121,5 @@ func newEnsureCmd() *ensureCmd {
 	}
 
 	root.cmd = cmd
-	root.cmd.Flags().BoolVar(&root.opts.choose, "choose", false, "Prompt for asset selection instead of auto-picking (prefers musl)")
 	return root
 }
