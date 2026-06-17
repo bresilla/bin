@@ -224,6 +224,74 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+var tarSuffixes = []string{".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".tar"}
+
+// archiveStem returns the asset name without its archive suffix, plus whether
+// it was a tar-family or a zip archive.
+func archiveStem(name string) (stem string, isTar, isZip bool) {
+	n := strings.ToLower(name)
+	for _, s := range tarSuffixes {
+		if strings.HasSuffix(n, s) {
+			return n[:len(n)-len(s)], true, false
+		}
+	}
+	if strings.HasSuffix(n, ".zip") {
+		return n[:len(n)-len(".zip")], false, true
+	}
+	return n, false, false
+}
+
+// preferArchiveType collapses tar-vs-zip duplicates of the same asset, keeping
+// the format preferred for the current OS: tar on Linux/BSD, zip on macOS and
+// Windows. Assets without a tar/zip twin are left untouched.
+func preferArchiveType(as []*Asset) []*Asset {
+	preferTar := false
+	for _, os := range resolver.GetOS() {
+		switch os {
+		case "linux", "freebsd", "openbsd", "netbsd", "dragonfly":
+			preferTar = true
+		}
+	}
+
+	type group struct{ tar, zip, other []*Asset }
+	groups := map[string]*group{}
+	order := []string{}
+	for _, a := range as {
+		stem, isTar, isZip := archiveStem(a.Name)
+		g := groups[stem]
+		if g == nil {
+			g = &group{}
+			groups[stem] = g
+			order = append(order, stem)
+		}
+		switch {
+		case isTar:
+			g.tar = append(g.tar, a)
+		case isZip:
+			g.zip = append(g.zip, a)
+		default:
+			g.other = append(g.other, a)
+		}
+	}
+
+	out := make([]*Asset, 0, len(as))
+	for _, stem := range order {
+		g := groups[stem]
+		if len(g.tar) > 0 && len(g.zip) > 0 {
+			if preferTar {
+				out = append(out, g.tar...)
+			} else {
+				out = append(out, g.zip...)
+			}
+		} else {
+			out = append(out, g.tar...)
+			out = append(out, g.zip...)
+		}
+		out = append(out, g.other...)
+	}
+	return out
+}
+
 func filterUsableAssets(as []*Asset) []*Asset {
 	out := make([]*Asset, 0, len(as))
 	for _, a := range as {
@@ -249,6 +317,7 @@ func (f *Filter) SelectReleaseAsset(repoName string, as []*Asset) (*FilteredAsse
 		log.Debugf("No installable assets after filtering; falling back to full list")
 		usable = as
 	}
+	usable = preferArchiveType(usable)
 
 	fp := Fingerprint(usable)
 

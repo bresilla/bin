@@ -304,3 +304,32 @@ func TestIsSupportedExt(t *testing.T) {
 	}
 
 }
+
+func TestPreferArchiveType(t *testing.T) {
+	in := []*Asset{
+		{Name: "eza_x86_64-unknown-linux-gnu.tar.gz"},
+		{Name: "eza_x86_64-unknown-linux-gnu.zip"},
+		{Name: "eza_x86_64-unknown-linux-musl.tar.gz"},
+		{Name: "eza_x86_64-unknown-linux-musl.zip"},
+		{Name: "eza_x86_64-unknown-linux.AppImage"}, // no twin -> kept
+	}
+
+	resolver = testLinuxAMDResolver
+	out := preferArchiveType(in)
+	if len(out) != 3 { // 2 tar + AppImage
+		t.Fatalf("linux: want 3, got %d", len(out))
+	}
+	for _, a := range out {
+		if strings.HasSuffix(strings.ToLower(a.Name), ".zip") {
+			t.Fatalf("linux should drop zip twins, got %s", a.Name)
+		}
+	}
+
+	resolver = testWindowsAMDResolver
+	out = preferArchiveType(in)
+	for _, a := range out {
+		if strings.HasSuffix(strings.ToLower(a.Name), ".tar.gz") {
+			t.Fatalf("windows should drop tar twins, got %s", a.Name)
+		}
+	}
+}
