@@ -334,17 +334,35 @@ func TestPreferArchiveType(t *testing.T) {
 	}
 }
 
-func TestAutoPickPrefersMusl(t *testing.T) {
-	m := []*FilteredAsset{
+func TestPreferMusl(t *testing.T) {
+	// gnu/musl twins of the same asset -> only musl kept
+	in := []*Asset{
 		{Name: "eza_x86_64-unknown-linux-gnu.tar.gz"},
 		{Name: "eza_x86_64-unknown-linux-musl.tar.gz"},
 	}
-	if got := autoPick(m).Name; got != "eza_x86_64-unknown-linux-musl.tar.gz" {
-		t.Fatalf("autoPick should prefer musl, got %s", got)
+	out := preferMusl(in)
+	if len(out) != 1 || !strings.Contains(out[0].Name, "musl") {
+		t.Fatalf("want only musl twin, got %v", names(out))
 	}
-	// glibc vs static -> static wins over gnu
-	m2 := []*FilteredAsset{{Name: "tool-linux-gnu"}, {Name: "tool-linux-static"}}
-	if got := autoPick(m2).Name; got != "tool-linux-static" {
-		t.Fatalf("autoPick should prefer static over gnu, got %s", got)
+	// genuinely different assets must NOT be collapsed
+	in2 := []*Asset{
+		{Name: "codex-app-server-x86_64-unknown-linux-musl.tar.gz"},
+		{Name: "codex-x86_64-unknown-linux-musl.tar.gz"},
 	}
+	if out2 := preferMusl(in2); len(out2) != 2 {
+		t.Fatalf("distinct assets must be kept, got %v", names(out2))
+	}
+	// gnu-only (no musl twin) is kept as-is
+	in3 := []*Asset{{Name: "tool-linux-gnu.tar.gz"}}
+	if out3 := preferMusl(in3); len(out3) != 1 {
+		t.Fatalf("gnu-only should be kept, got %v", names(out3))
+	}
+}
+
+func names(as []*Asset) []string {
+	out := make([]string, len(as))
+	for i, a := range as {
+		out[i] = a.Name
+	}
+	return out
 }
