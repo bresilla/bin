@@ -4,10 +4,12 @@ package ui
 import (
 	"bufio"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 	ltable "github.com/charmbracelet/lipgloss/table"
+	"golang.org/x/term"
 )
 
 // Palette — terminal color indexes used across the CLI and TUI.
@@ -175,16 +177,49 @@ type ListRow struct {
 	Pinned  bool
 }
 
-// ListTable renders the binary list as a rounded, colorized table.
-func ListTable(rows []ListRow) string {
+// ListTable renders the binary list as a rounded, colorized table sized to the
+// given terminal width. Columns are budgeted and truncated so rows never wrap.
+func ListTable(rows []ListRow, width int) string {
+	if width < 40 {
+		width = 40
+	}
+	// Per-column padding (2 each) + borders for 5 columns ≈ 16 cols of chrome.
+	budget := width - 16
+	if budget < 40 {
+		budget = 40
+	}
+	verW, tagW, stW := 12, 16, 9
+	flex := budget - verW - tagW - stW
+	if flex < 24 {
+		flex = 24
+	}
+	nameW := flex * 11 / 20 // ~55% to the binary path
+	repoW := flex - nameW
+
 	t := ltable.New().
 		Border(lipgloss.RoundedBorder()).
 		BorderStyle(BorderStyle).
-		Headers("BINARY", "VERSION", "TAGS", "STATUS", "URL").
+		Width(width).
+		Headers("BINARY", "VERSION", "TAGS", "STATUS", "REPO").
 		StyleFunc(func(row, col int) lipgloss.Style {
 			st := lipgloss.NewStyle().Padding(0, 1)
 			if row == ltable.HeaderRow {
 				return st.Bold(true).Foreground(ColorPrimary)
+			}
+			switch col {
+			case 1: // version
+				if row >= 0 && row < len(rows) && rows[row].Pinned {
+					return st.Foreground(ColorWarn)
+				}
+			case 2: // tags
+				return st.Foreground(ColorTag)
+			case 3: // status
+				if row >= 0 && row < len(rows) && !rows[row].OK {
+					return st.Foreground(ColorErr)
+				}
+				return st.Foreground(ColorOK)
+			case 4: // repo
+				return st.Foreground(ColorMuted)
 			}
 			return st
 		})
@@ -192,15 +227,54 @@ func ListTable(rows []ListRow) string {
 	for _, r := range rows {
 		ver := r.Version
 		if r.Pinned {
-			ver = PinStyle.Render("★ ") + ver
+			ver = "★ " + ver
+		}
+		status := "● ok"
+		if !r.OK {
+			status = "● missing"
 		}
 		t.Row(
-			r.Path,
-			ver,
-			Tags(r.Tags),
-			StatusDot(r.OK),
-			MutedStyle.Render(r.URL),
+			clip(r.Path, nameW),
+			clip(ver, verW),
+			clip(strings.Join(r.Tags, ","), tagW),
+			status,
+			clip(repoShortURL(r.URL), repoW),
 		)
 	}
 	return t.String()
+}
+
+// clip truncates s to w columns with an ellipsis (plain text).
+func clip(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	return string(r[:w-1]) + "…"
+}
+
+// repoShortURL strips the scheme from a repo URL.
+func repoShortURL(u string) string {
+	u = strings.TrimPrefix(u, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	return strings.TrimSuffix(u, "/")
+}
+
+// TerminalWidth returns the current terminal width, or a sensible fallback.
+func TerminalWidth() int {
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		return w
+	}
+	if c := os.Getenv("COLUMNS"); c != "" {
+		if n, err := strconv.Atoi(c); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 100
 }

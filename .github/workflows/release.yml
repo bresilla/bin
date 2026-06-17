@@ -46,9 +46,9 @@ jobs:
             go build -trimpath -ldflags "$LDFLAGS" -o "$out" ./src
             pkg="bin_${GOOS}_${GOARCH}"
             if [ "$GOOS" = "windows" ]; then
-              zip -q "dist/${pkg}.zip" "$out" README.md
+              zip -q "dist/${pkg}.zip" "$out"
             else
-              tar -czf "dist/${pkg}.tar.gz" "$out" README.md
+              tar -czf "dist/${pkg}.tar.gz" "$out"
             fi
             rm -f "$out"
           done
