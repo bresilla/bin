@@ -16,8 +16,8 @@ import (
 	"github.com/bresilla/bin/src/pkg/config"
 	"github.com/bresilla/bin/src/pkg/options"
 	bstrings "github.com/bresilla/bin/src/pkg/strings"
+	"github.com/bresilla/bin/src/pkg/ui"
 	"github.com/caarlos0/log"
-	"github.com/cheggaaa/pb"
 	"github.com/h2non/filetype"
 	"github.com/h2non/filetype/matchers"
 	"github.com/h2non/filetype/types"
@@ -437,12 +437,11 @@ func (f *Filter) ProcessURL(gf *FilteredAsset) (*finalFile, error) {
 	// We're caching the whole file into memory so we can prompt
 	// the user which file they want to download
 
-	log.Infof("Starting download of %s", gf.URL)
 	var reader io.Reader = res.Body
 	if !Quiet {
-		bar := pb.Full.Start64(res.ContentLength)
-		defer bar.Finish()
-		reader = bar.NewProxyReader(res.Body)
+		pr := ui.NewProgressReader(res.Body, res.ContentLength, gf.String())
+		defer pr.Finish()
+		reader = pr
 	}
 	buf := new(bytes.Buffer)
 	_, err = io.Copy(buf, reader)

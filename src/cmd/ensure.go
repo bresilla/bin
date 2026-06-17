@@ -101,7 +101,7 @@ func newEnsureCmd() *ensureCmd {
 				if err != nil {
 					return err
 				}
-				log.Infof("Done ensuring %s to %s", os.ExpandEnv(binCfg.Path), color.GreenString(binCfg.Version))
+				log.Infof("Done ensuring %s to %s", os.ExpandEnv(binCfg.Path), color.GreenString(pResult.Version))
 			}
 			return nil
 		},

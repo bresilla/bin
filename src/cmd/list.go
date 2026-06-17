@@ -65,7 +65,7 @@ func newListCmd() *listCmd {
 				return nil
 			}
 
-			fmt.Println(ui.ListTable(rows))
+			fmt.Println(ui.ListTable(rows, ui.TerminalWidth()))
 			fmt.Println()
 			return nil
 		},
