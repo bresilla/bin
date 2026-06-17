@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.14] - 2026-06-17
+
+### <!-- 0 -->⛰️  Features
+
+- Improve install logic and asset filtering
+
+### <!-- 1 -->🐛 Bug Fixes
+
+- Fix the `preferMusl` function
+
 ## [0.1.13] - 2026-06-17
 
 ### <!-- 0 -->⛰️  Features
