@@ -44,6 +44,10 @@ type Binary struct {
 	// with no tags is treated as belonging to "default". Persisted in the
 	// manifest since they're portable, not per-machine state.
 	Tags []string `json:"tags,omitempty"`
+	// Patch, when set, makes bin fix up the installed ELF after
+	// install/ensure/update (interpreter + bundled/system libraries) so prebuilt
+	// binaries run on this host. Portable intent, so it lives in the manifest.
+	Patch bool `json:"patch,omitempty"`
 	// StateURL holds a release- or version-specific URL, persisted only in state
 	StateURL string `json:"-"`
 	// SelectedAsset is the version-normalized name of the release asset the
@@ -478,6 +482,10 @@ func UpsertBinary(c *Binary) error {
 			if c.Description == "" {
 				c.Description = existing.Description
 			}
+			// Patch is a portable per-binary intent; preserve it unless re-set.
+			if !c.Patch {
+				c.Patch = existing.Patch
+			}
 		}
 		if len(c.Tags) == 0 {
 			c.Tags = []string{"default"}
@@ -529,6 +537,7 @@ type manifestBinary struct {
 	Provider    string   `json:"provider"`
 	Description string   `json:"description,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
+	Patch       bool     `json:"patch,omitempty"`
 }
 
 func writeManifest(manifestPath string) error {
@@ -554,6 +563,7 @@ func writeManifest(manifestPath string) error {
 			Provider:    b.Provider,
 			Description: b.Description,
 			Tags:        b.Tags,
+			Patch:       b.Patch,
 		}
 	}
 	enc := json.NewEncoder(f)

@@ -234,15 +234,15 @@ func newListKeys() listKeyMap {
 // ---- model ----
 
 type tuiModel struct {
-	tags      []string // selectable tag scopes, "all" first
-	tagIdx    int
-	rows      []*binRow
-	list      list.Model
-	keys      listKeyMap
-	app       lipgloss.Style
-	busy      int
-	confirm   bool
-	confirmTo string
+	tags       []string // selectable tag scopes, "all" first
+	tagIdx     int
+	rows       []*binRow
+	list       list.Model
+	keys       listKeyMap
+	app        lipgloss.Style
+	busy       int
+	confirm    bool
+	confirmTo  string
 	confirmYes bool
 
 	width, height int

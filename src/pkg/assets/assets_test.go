@@ -1,9 +1,14 @@
 package assets
 
 import (
+	"archive/tar"
+	"bytes"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 type mockOSResolver struct {
@@ -379,5 +384,34 @@ func TestAppImageNotPreferredOverBinary(t *testing.T) {
 	})
 	if !strings.HasSuffix(chosen2, ".AppImage") {
 		t.Fatalf("AppImage-only release should pick the AppImage, got %q", chosen2)
+	}
+}
+
+func TestZstTarExtraction(t *testing.T) {
+	resolver = testLinuxAMDResolver
+	// build a tar with a single (fake) binary file
+	var tarbuf bytes.Buffer
+	tw := tar.NewWriter(&tarbuf)
+	content := append([]byte{0x7f, 'E', 'L', 'F'}, make([]byte, 64)...)
+	_ = tw.WriteHeader(&tar.Header{Name: "ollama", Mode: 0o755, Size: int64(len(content)), Typeflag: tar.TypeReg})
+	_, _ = tw.Write(content)
+	_ = tw.Close()
+	// zstd-compress it (-> .tar.zst)
+	var zbuf bytes.Buffer
+	zw, _ := zstd.NewWriter(&zbuf)
+	_, _ = zw.Write(tarbuf.Bytes())
+	_ = zw.Close()
+
+	f := NewFilter(&FilterOpts{})
+	ff, err := f.processReader(bytes.NewReader(zbuf.Bytes()))
+	if err != nil {
+		t.Fatalf("processReader(.tar.zst): %v", err)
+	}
+	if ff.Name != "ollama" {
+		t.Fatalf("extracted name = %q, want ollama", ff.Name)
+	}
+	got, _ := io.ReadAll(ff.Source)
+	if !bytes.Equal(got, content) {
+		t.Fatalf("extracted content mismatch (%d bytes)", len(got))
 	}
 }

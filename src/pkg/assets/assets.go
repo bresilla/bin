@@ -24,6 +24,7 @@ import (
 	"github.com/h2non/filetype"
 	"github.com/h2non/filetype/matchers"
 	"github.com/h2non/filetype/types"
+	"github.com/klauspost/compress/zstd"
 	"github.com/krolaw/zipstream"
 	"github.com/xi2/xz"
 )
@@ -70,6 +71,17 @@ type finalFile struct {
 	Name               string
 	PackagePath        string
 	PackageFingerprint []string
+	// Sidecars holds shared libraries shipped alongside the chosen binary in the
+	// same archive (the binary's dependency closure), keyed by basename. Only
+	// populated when FilterOpts.CollectLibs is set.
+	Sidecars map[string]*Sidecar
+}
+
+// Sidecar is one shared library extracted from an archive: either a regular
+// file (Data set) or a symlink (Link set to the target's basename).
+type Sidecar struct {
+	Data []byte
+	Link string
 }
 
 type platformResolver interface {
@@ -84,6 +96,7 @@ type Filter struct {
 	name               string
 	packagePath        string
 	packageFingerprint []string
+	sidecars           map[string]*Sidecar
 }
 
 type FilterOpts struct {
@@ -114,6 +127,11 @@ type FilterOpts struct {
 	// NonInteractive makes asset selection fail instead of prompting when it
 	// can't decide on its own. Used by the TUI, which owns the terminal.
 	NonInteractive bool
+
+	// CollectLibs makes archive extraction also capture the chosen binary's
+	// shared-library dependency closure (sibling .so files in the same archive),
+	// so the caller can install them next to the binary and patch its RUNPATH.
+	CollectLibs bool
 }
 
 type runtimeResolver struct{}
@@ -183,7 +201,8 @@ var installableSuffixes = []string{
 	".tar.gz", ".tgz",
 	".tar.xz", ".txz",
 	".tar.bz2", ".tbz2", ".tbz",
-	".tar", ".zip", ".gz", ".xz", ".bz2",
+	".tar.zst", ".tzst",
+	".tar", ".zip", ".gz", ".xz", ".bz2", ".zst",
 }
 
 // ignoredExts are file extensions that are never installable binaries:
@@ -196,9 +215,6 @@ var ignoredExts = map[string]bool{
 	"json": true, "txt": true, "md": true, "yaml": true, "yml": true,
 	"deb": true, "rpm": true, "msi": true, "pkg": true, "dmg": true,
 	"apk": true, "snap": true, "flatpak": true, "whl": true,
-	// zstd isn't supported by the extractor, so don't offer it (this also
-	// covers .tar.zst, whose filepath.Ext is ".zst").
-	"zst": true,
 	// libraries / object files are never the CLI binary we want.
 	"a": true, "o": true, "so": true, "dll": true, "dylib": true, "lib": true,
 }
@@ -280,7 +296,7 @@ func preferMusl(as []*Asset) []*Asset {
 	return out
 }
 
-var tarSuffixes = []string{".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".tar"}
+var tarSuffixes = []string{".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".tbz", ".tar.zst", ".tzst", ".tar"}
 
 // archiveStem returns the asset name without its archive suffix, plus whether
 // it was a tar-family or a zip archive.
@@ -649,6 +665,8 @@ func (f *Filter) processReader(r io.Reader) (*finalFile, error) {
 		processor = f.processXz
 	case matchers.TypeBz2:
 		processor = f.processBz2
+	case matchers.TypeZstd:
+		processor = f.processZst
 	case matchers.TypeZip:
 		processor = f.processZip
 	}
@@ -667,12 +685,15 @@ func (f *Filter) processReader(r io.Reader) (*finalFile, error) {
 		if len(outFile.PackageFingerprint) > 0 {
 			f.packageFingerprint = outFile.PackageFingerprint
 		}
+		if len(outFile.Sidecars) > 0 {
+			f.sidecars = outFile.Sidecars
+		}
 
 		// In case of e.g. a .tar.gz, process the uncompressed archive by calling recursively
 		return f.processReader(outputFile)
 	}
 
-	return &finalFile{Source: outputFile, Name: f.name, PackagePath: f.packagePath, PackageFingerprint: f.packageFingerprint}, err
+	return &finalFile{Source: outputFile, Name: f.name, PackagePath: f.packagePath, PackageFingerprint: f.packageFingerprint, Sidecars: f.sidecars}, err
 }
 
 // processGz receives a tar.gz file and returns the
@@ -689,6 +710,7 @@ func (f *Filter) processGz(name string, r io.Reader) (*finalFile, error) {
 func (f *Filter) processTar(name string, r io.Reader) (*finalFile, error) {
 	tr := tar.NewReader(r)
 	tarFiles := map[string][]byte{}
+	tarLinks := map[string]string{} // symlink path -> link target
 	if len(f.opts.PackagePath) > 0 {
 		log.Debugf("Processing tag with PackagePath %s\n", f.opts.PackagePath)
 	}
@@ -702,12 +724,15 @@ func (f *Filter) processTar(name string, r io.Reader) (*finalFile, error) {
 			continue
 		}
 
-		if header.Typeflag == tar.TypeReg {
+		switch header.Typeflag {
+		case tar.TypeReg:
 			bs, err := io.ReadAll(tr)
 			if err != nil {
 				return nil, err
 			}
 			tarFiles[header.Name] = bs
+		case tar.TypeSymlink, tar.TypeLink:
+			tarLinks[header.Name] = header.Linkname
 		}
 	}
 	if len(tarFiles) == 0 {
@@ -718,13 +743,91 @@ func (f *Filter) processTar(name string, r io.Reader) (*finalFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &finalFile{Source: bytes.NewReader(tarFiles[selectedFile]), Name: filepath.Base(selectedFile), PackagePath: selectedFile, PackageFingerprint: f.packageFingerprint}, nil
+
+	out := &finalFile{Source: bytes.NewReader(tarFiles[selectedFile]), Name: filepath.Base(selectedFile), PackagePath: selectedFile, PackageFingerprint: f.packageFingerprint}
+	if f.opts.CollectLibs {
+		out.Sidecars = collectLibClosure(tarFiles[selectedFile], tarFiles, tarLinks)
+	}
+	return out, nil
+}
+
+// collectLibClosure resolves the shared-library dependency closure of binary
+// (its DT_NEEDED, transitively) against the shared libraries present in the same
+// archive, following symlinks. System libraries not shipped in the archive are
+// skipped. Returns sidecars keyed by basename (regular files and symlinks).
+func collectLibClosure(binary []byte, files map[string][]byte, links map[string]string) map[string]*Sidecar {
+	// index archive entries by basename
+	fileByBase := map[string][]byte{}
+	for p, data := range files {
+		if isSharedLib(p) {
+			fileByBase[filepath.Base(p)] = data
+		}
+	}
+	linkByBase := map[string]string{}
+	for p, target := range links {
+		if isSharedLib(p) {
+			linkByBase[filepath.Base(p)] = filepath.Base(target)
+		}
+	}
+
+	needed := func(data []byte) []string {
+		ef, err := elf.NewFile(bytes.NewReader(data))
+		if err != nil {
+			return nil
+		}
+		defer ef.Close()
+		libs, _ := ef.ImportedLibraries()
+		return libs
+	}
+
+	out := map[string]*Sidecar{}
+	seen := map[string]bool{}
+	var queue []string
+	queue = append(queue, needed(binary)...)
+
+	for len(queue) > 0 {
+		base := queue[0]
+		queue = queue[1:]
+		if base == "" || seen[base] {
+			continue
+		}
+		seen[base] = true
+
+		if target, ok := linkByBase[base]; ok {
+			out[base] = &Sidecar{Link: target}
+			queue = append(queue, target) // resolve the link target too
+			continue
+		}
+		if data, ok := fileByBase[base]; ok {
+			out[base] = &Sidecar{Data: data}
+			queue = append(queue, needed(data)...)
+		}
+		// otherwise it's a system lib (not in the archive); skip.
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// isSharedLib reports whether a path looks like a shared object (.so / .so.N…).
+func isSharedLib(p string) bool {
+	b := filepath.Base(p)
+	return strings.HasSuffix(b, ".so") || strings.Contains(b, ".so.")
 }
 
 func (f *Filter) processBz2(name string, r io.Reader) (*finalFile, error) {
 	br := bzip2.NewReader(r)
 
 	return &finalFile{Source: br, Name: name}, nil
+}
+
+func (f *Filter) processZst(name string, r io.Reader) (*finalFile, error) {
+	zr, err := zstd.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	return &finalFile{Source: zr.IOReadCloser(), Name: name}, nil
 }
 
 func (f *Filter) processXz(name string, r io.Reader) (*finalFile, error) {
@@ -868,7 +971,7 @@ func isSupportedExt(filename string) bool {
 		case msiType, matchers.TypeDeb, matchers.TypeRpm, ascType:
 			log.Debugf("Filename %s doesn't have a supported extension", filename)
 			return false
-		case matchers.TypeGz, types.Unknown, matchers.TypeZip, matchers.TypeXz, matchers.TypeTar, matchers.TypeBz2, matchers.TypeExe:
+		case matchers.TypeGz, types.Unknown, matchers.TypeZip, matchers.TypeXz, matchers.TypeTar, matchers.TypeBz2, matchers.TypeZstd, matchers.TypeExe:
 			break
 		default:
 			log.Debugf("Filename %s doesn't have a supported extension", filename)
